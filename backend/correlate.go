@@ -119,54 +119,26 @@ type searchResult struct {
 	dy, dx     int // 规范解纵移、横移
 }
 
-func projectionCounts(m [][]uint8, n, poseIndex int) ([]int, []int) {
-	rows := make([]int, n)
-	cols := make([]int, n)
-	for r := 0; r < n; r++ {
-		for c := 0; c < n; c++ {
-			if m[r][c] == 0 {
-				continue
-			}
-			pr, pc := applyPose(poseIndex, r, c, n)
-			rows[pr]++
-			cols[pc]++
-		}
-	}
-	return rows, cols
-}
+// sparsePairCutoff 是稀疏点对路径与稠密 FFT 路径的选择阈值：
+// 当 Kref*Krec（点对计数代价）超过 4*L^2（单姿态二维 FFT 的量级）时走 FFT。
+const sparsePairCutoff = 4
 
-func bestProjectionOffsets(reference, recheck []int, n int) []int {
-	best := -1
-	offsets := make([]int, 0, 2*n-1)
-	for shift := -(n - 1); shift <= n-1; shift++ {
-		score := 0
-		for i, count := range recheck {
-			j := i + shift
-			if j >= 0 && j < n {
-				score += count * reference[j]
-			}
-		}
-		if score > best {
-			best = score
-			offsets = offsets[:0]
-			offsets = append(offsets, shift)
-		} else if score == best {
-			offsets = append(offsets, shift)
-		}
-	}
-	return offsets
-}
-
-// searchMaxOverlap 用自实现的二维 FFT 做精确整数互相关：
-// 对每种姿态，一次二维相关即得到横纵各 -(N-1)..(N-1) 全部 (2N-1)^2 个整数平移的重合数，
-// 因此稠密满尺寸输入的复杂度为 O(N^2 log N)，不会退化为逐点尝试全部平移。
+// searchMaxOverlap 精确穷举 8 种姿态 × 横纵各 -(N-1)..(N-1) 全部 (2N-1)^2 个整数平移。
+// 两条路径都不得用任何启发式剪枝——二维最优平移在任一维投影上都可能不是最优，
+// 按一维最佳偏移取笛卡尔积会漏掉真正的二维最优（稀疏点阵并列解漏报即源于此）。
+//
+// 稀疏路径：对每个 (参考点, 姿态变换后的复检点) 对，平移 (rr-pr, cc-pc) 命中一次，
+// 用位移直方图直接累计每个整数平移的重合数，复杂度 O(Kref*Krec)。
+//
+// 稠密路径：用自实现的二维 FFT 做精确整数互相关。对每种姿态，一次二维相关即得到
+// 全部 (2N-1)^2 个整数平移的重合数，复杂度 O(N^2 log N)，满尺寸 512 稠密输入也不退化为逐点尝试。
 //
 // 精确性：矩阵元素为 0/1，相关值上界为 N^2 <= 262144，float64 尾数 53 位，
 // L<=1024 的 FFT 舍入误差上界约 1e-10 量级，远低于 0.5，四舍五入后即为精确整数；
 // 规范解还会被 countOverlapDirect 用纯整数逐一复核。
 func searchMaxOverlap(ref, rec [][]uint8, n int) searchResult {
+	span := 2*n - 1
 	if countOnes(ref) == 0 || countOnes(rec) == 0 {
-		span := 2*n - 1
 		return searchResult{
 			maxOverlap: 0,
 			tieCount:   8 * span * span,
@@ -176,28 +148,116 @@ func searchMaxOverlap(ref, rec [][]uint8, n int) searchResult {
 		}
 	}
 
-	refRows, refCols := projectionCounts(ref, n, 0)
-	res := searchResult{maxOverlap: -1}
-	for p := 0; p < 8; p++ {
-		recRows, recCols := projectionCounts(rec, n, p)
-		dys := bestProjectionOffsets(refRows, recRows, n)
-		dxs := bestProjectionOffsets(refCols, recCols, n)
-		for _, dy := range dys {
-			for _, dx := range dxs {
-				v := countOverlapDirect(ref, rec, n, p, dy, dx)
-				// 严格大于才替换：姿态顺序、dy、dx 均升序遍历，首个最大值即规范解。
-				if v > res.maxOverlap {
-					res.maxOverlap = v
-					res.tieCount = 1
-					res.poseIndex = p
-					res.dy, res.dx = dy, dx
-				} else if v == res.maxOverlap {
-					res.tieCount++
+	refPts := gatherPoints(ref, n)
+	recPts := gatherPoints(rec, n)
+
+	// L 为不小于 2N-1 的最小 2 的幂，仅 FFT 路径需要。
+	l := 1
+	for l < span {
+		l <<= 1
+	}
+	useFFT := len(refPts)*len(recPts) >= sparsePairCutoff*l*l
+
+	var roots *fftRoots
+	var refFreq, corr, fftBuf []complex128
+	var hist []int // 仅稀疏路径使用：按姿态复用、按命中下标清零
+	if useFFT {
+		roots = newFFTRoots(l)
+		refFreq = make([]complex128, l*l)
+		for _, p := range refPts {
+			refFreq[p[0]*l+p[1]] = 1
+		}
+		roots.fft2(refFreq, l, false)
+		corr = make([]complex128, l*l)
+		fftBuf = make([]complex128, l*l)
+	} else {
+		hist = make([]int, span*span)
+	}
+
+	traverse := func(p int, visit func(dy, dx, v int)) {
+		if useFFT {
+			// Z = IFFT(FFT(ref) · conj(FFT(posedRec)))，
+			// 则 Z[dy,dx]（负偏移回绕到 +L）恰为平移 (dy,dx) 的重合数：
+			// Z[d]=Σ_i A[i]B[i-d]，令 i=b+d 即 Σ_b A[b+d]B[b]。
+			clear(fftBuf)
+			for _, q := range recPts {
+				pr, pc := applyPose(p, q[0], q[1], n)
+				fftBuf[pr*l+pc] = 1
+			}
+			roots.fft2(fftBuf, l, false)
+			for i := range fftBuf {
+				corr[i] = refFreq[i] * complex(real(fftBuf[i]), -imag(fftBuf[i]))
+			}
+			roots.fft2(corr, l, true)
+			for dy := -(n - 1); dy <= n-1; dy++ {
+				ry := dy
+				if ry < 0 {
+					ry += l
 				}
+				for dx := -(n - 1); dx <= n-1; dx++ {
+					cx := dx
+					if cx < 0 {
+						cx += l
+					}
+					v := int(math.Round(real(corr[ry*l+cx])))
+					visit(dy, dx, v)
+				}
+			}
+		} else {
+			// 每个 (参考点, 变换后复检点) 对恰好命中平移 (rr-pr, cc-pc) 一次。
+			touched := make([]int, 0, len(refPts)*len(recPts))
+			for _, q := range recPts {
+				pr, pc := applyPose(p, q[0], q[1], n)
+				for _, a := range refPts {
+					dy := a[0] - pr
+					dx := a[1] - pc
+					idx := (dy+n-1)*span + (dx + n - 1)
+					if hist[idx] == 0 {
+						touched = append(touched, idx)
+					}
+					hist[idx]++
+				}
+			}
+			// 未被任何点对命中的平移重合数为 0。
+			for dy := -(n - 1); dy <= n-1; dy++ {
+				for dx := -(n - 1); dx <= n-1; dx++ {
+					visit(dy, dx, hist[(dy+n-1)*span+(dx+n-1)])
+				}
+			}
+			for _, idx := range touched {
+				hist[idx] = 0
 			}
 		}
 	}
+
+	// 严格大于才替换：姿态顺序、dy、dx 均升序遍历，首个最大值即规范解。
+	res := searchResult{maxOverlap: -1}
+	for p := 0; p < 8; p++ {
+		traverse(p, func(dy, dx, v int) {
+			if v > res.maxOverlap {
+				res.maxOverlap = v
+				res.tieCount = 1
+				res.poseIndex = p
+				res.dy, res.dx = dy, dx
+			} else if v == res.maxOverlap {
+				res.tieCount++
+			}
+		})
+	}
 	return res
+}
+
+// gatherPoints 收集二值方阵中全部缺陷坐标。
+func gatherPoints(m [][]uint8, n int) []point {
+	pts := make([]point, 0)
+	for r := 0; r < n; r++ {
+		for c := 0; c < n; c++ {
+			if m[r][c] != 0 {
+				pts = append(pts, point{r, c})
+			}
+		}
+	}
+	return pts
 }
 
 // countOverlapDirect 纯整数直接计数：复检图经姿态 p 与平移 (dy,dx) 后落在参考图缺陷上的点数。
