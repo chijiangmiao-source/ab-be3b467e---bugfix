@@ -102,6 +102,22 @@ func bruteForce(ref, rec grid, n int) expected {
 	return e
 }
 
+// allOptima 独立整数穷举列出全部达到最大重合的 (姿态, dy, dx)，按裁决顺序排列。
+func allOptima(ref, rec grid, n int) [][3]int {
+	e := bruteForce(ref, rec, n)
+	opts := [][3]int{}
+	for p := 0; p < 8; p++ {
+		for dy := -(n - 1); dy <= n-1; dy++ {
+			for dx := -(n - 1); dx <= n-1; dx++ {
+				if countOverlap(ref, rec, n, p, dy, dx) == e.max {
+					opts = append(opts, [3]int{p, dy, dx})
+				}
+			}
+		}
+	}
+	return opts
+}
+
 func newGrid(n int) grid {
 	g := make(grid, n)
 	for i := range g {
@@ -269,6 +285,102 @@ func caseDeterministic(base string) {
 		resp.Overlay.RecheckOut == 0,
 		fmt.Sprintf("matched=%d recOnly=%d recOut=%d", len(resp.Overlay.Matched),
 			len(resp.Overlay.RecheckOnly), resp.Overlay.RecheckOut))
+	check("确定性用例最优唯一", e.ties == 1, fmt.Sprintf("tieCount=%d", e.ties))
+}
+
+// caseSparseFourWayTie 复现审计台缺陷场景：稀疏 16×16 点阵的二维最优平移
+// 曾被一维行/列投影剪枝漏掉，并列最优数量被错误报告为 1。
+// 独立整数穷举应得到 4 组并列最优，规范解按既有裁决顺序取 rot90/(4,0)。
+func caseSparseFourWayTie(base string) {
+	const n = 16
+	ref := newGrid(n)
+	rec := newGrid(n)
+	refPts := [][2]int{
+		{2, 2}, {6, 7}, {6, 8}, {7, 2}, {7, 3}, {8, 5}, {9, 4}, {9, 9},
+		{10, 2}, {10, 10}, {10, 13}, {11, 12}, {12, 13}, {13, 4},
+	}
+	recPts := [][2]int{
+		{2, 2}, {2, 6}, {2, 8}, {2, 13}, {3, 5}, {3, 11}, {5, 2}, {5, 3},
+		{8, 8}, {9, 6}, {10, 10}, {11, 5}, {12, 3}, {12, 12},
+	}
+	for _, p := range refPts {
+		ref[p[0]][p[1]] = 1
+	}
+	for _, p := range recPts {
+		rec[p[0]][p[1]] = 1
+	}
+	status, body, err := postAudit(base, gridToText(ref), gridToText(rec))
+	if err != nil {
+		check("稀疏点阵四组并列最优用例", false, err.Error())
+		return
+	}
+	var resp auditResp
+	if err := json.Unmarshal(body, &resp); err != nil || status != 200 {
+		check("稀疏点阵四组并列最优用例", false, fmt.Sprintf("status=%d body=%s", status, body))
+		return
+	}
+	e := bruteForce(ref, rec, n)
+	ok := resp.MaxOverlap == 4 && e.max == 4 &&
+		resp.TieCount == 4 && e.ties == 4 &&
+		resp.Transform.PoseIndex == 1 && resp.Transform.Dy == 4 && resp.Transform.Dx == 0 &&
+		e.pose == 1 && e.dy == 4 && e.dx == 0
+	check("稀疏点阵：最大重合 4、并列数 4、规范解 rot90/(4,0)", ok,
+		fmt.Sprintf("api max=%d ties=%d transform=%+v，穷举 %+v",
+			resp.MaxOverlap, resp.TieCount, resp.Transform, e))
+
+	// 独立整数穷举逐个核对四组最优解：rot90(4,0)、rot180(-4,-5)、flipTB(-3,0)、antiTranspose(3,0)。
+	wantOpts := [][3]int{{1, 4, 0}, {2, -4, -5}, {5, -3, 0}, {7, 3, 0}}
+	gotOpts := allOptima(ref, rec, n)
+	same := len(gotOpts) == len(wantOpts)
+	for i := range wantOpts {
+		if same && gotOpts[i] != wantOpts[i] {
+			same = false
+		}
+	}
+	check("独立整数穷举列出四组最优解", same, fmt.Sprintf("穷举得到 %v，期望 %v", gotOpts, wantOpts))
+
+	// 红蓝叠加证据：规范解下 4 个重合点、各 10 个独占点、2 个画布外缺陷、总数 14/14。
+	wantMatched := map[[2]int]bool{
+		{7, 3}: true, {9, 4}: true, {10, 13}: true, {12, 13}: true,
+	}
+	matchedOK := len(resp.Overlay.Matched) == 4
+	for _, p := range resp.Overlay.Matched {
+		if !wantMatched[p] {
+			matchedOK = false
+		}
+	}
+	check("稀疏点阵叠加证据（4 重合/2 画布外/总数不变）", matchedOK &&
+		resp.ReferenceCount == 14 && resp.RecheckCount == 14 &&
+		len(resp.Overlay.ReferenceOnly) == 10 && len(resp.Overlay.RecheckOnly) == 10 &&
+		resp.Overlay.RecheckOut == 2,
+		fmt.Sprintf("matched=%v refOnly=%d recOnly=%d recOut=%d count=%d/%d",
+			resp.Overlay.Matched, len(resp.Overlay.ReferenceOnly),
+			len(resp.Overlay.RecheckOnly), resp.Overlay.RecheckOut,
+			resp.ReferenceCount, resp.RecheckCount))
+}
+
+// caseAllZeros 覆盖全 0 场景：最大重合 0，全部 8×(2N-1)² 个变换互为并列最优，
+// 规范解取姿态 0 与最小偏移，叠加证据全空。
+func caseAllZeros(base string) {
+	const n = 16
+	text := gridToText(newGrid(n))
+	status, body, err := postAudit(base, text, text)
+	if err != nil {
+		check("全 0 用例", false, err.Error())
+		return
+	}
+	var resp auditResp
+	if err := json.Unmarshal(body, &resp); err != nil || status != 200 {
+		check("全 0 用例", false, fmt.Sprintf("status=%d body=%s", status, body))
+		return
+	}
+	const allTies = 8 * (2*n - 1) * (2*n - 1)
+	ok := resp.MaxOverlap == 0 && resp.TieCount == allTies &&
+		resp.Transform.PoseIndex == 0 && resp.Transform.Dy == -(n-1) && resp.Transform.Dx == -(n-1) &&
+		resp.ReferenceCount == 0 && resp.RecheckCount == 0 &&
+		len(resp.Overlay.Matched) == 0 && len(resp.Overlay.ReferenceOnly) == 0 &&
+		len(resp.Overlay.RecheckOnly) == 0 && resp.Overlay.RecheckOut == 0
+	check("全 0 用例（全部变换并列、叠加证据为空）", ok, fmt.Sprintf("resp=%+v", resp))
 }
 
 func caseDenseAllOnes(base string, n int) {
@@ -483,6 +595,8 @@ func main() {
 	caseDeterministic(frontendURL)
 	caseMirror(frontendURL)
 	caseOutOfCanvas(frontendURL)
+	caseSparseFourWayTie(frontendURL)
+	caseAllZeros(frontendURL)
 	caseDenseAllOnes(frontendURL, 64)
 	caseDenseAllOnes(frontendURL, 512)
 	caseValidation(frontendURL)

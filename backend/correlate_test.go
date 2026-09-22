@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/rand"
+	"reflect"
 	"testing"
 )
 
@@ -34,6 +35,192 @@ func randomMatrix(rng *rand.Rand, n int, density float64) [][]uint8 {
 		}
 	}
 	return m
+}
+
+func pointsToMatrix(n int, pts [][2]int) [][]uint8 {
+	m := make([][]uint8, n)
+	for r := range m {
+		m[r] = make([]uint8, n)
+	}
+	for _, p := range pts {
+		m[p[0]][p[1]] = 1
+	}
+	return m
+}
+
+// TestSparseFourWayTie 复现审计台缺陷：稀疏 16×16 点阵存在 4 组并列最优，
+// 旧实现用「行投影最优 dy × 列投影最优 dx」一维剪枝，漏掉了其中 3 组，
+// 错误报告并列最优数量为 1（最大重合 4 与规范解 rot90/(4,0) 本身正确）。
+func TestSparseFourWayTie(t *testing.T) {
+	const n = 16
+	refPts := [][2]int{
+		{2, 2}, {6, 7}, {6, 8}, {7, 2}, {7, 3}, {8, 5}, {9, 4}, {9, 9},
+		{10, 2}, {10, 10}, {10, 13}, {11, 12}, {12, 13}, {13, 4},
+	}
+	recPts := [][2]int{
+		{2, 2}, {2, 6}, {2, 8}, {2, 13}, {3, 5}, {3, 11}, {5, 2}, {5, 3},
+		{8, 8}, {9, 6}, {10, 10}, {11, 5}, {12, 3}, {12, 12},
+	}
+	ref := pointsToMatrix(n, refPts)
+	rec := pointsToMatrix(n, recPts)
+
+	got := searchMaxOverlap(ref, rec, n)
+	want := bruteForce(ref, rec, n)
+	if got != want {
+		t.Fatalf("FFT 搜索与独立整数穷举不一致：%+v，暴力参照 %+v", got, want)
+	}
+	if got.maxOverlap != 4 {
+		t.Fatalf("最大重合应为 4，得到 %d", got.maxOverlap)
+	}
+	if got.tieCount != 4 {
+		t.Fatalf("并列最优数量应为 4，得到 %d", got.tieCount)
+	}
+	if got.poseIndex != 1 || got.dy != 4 || got.dx != 0 {
+		t.Fatalf("规范解应为 rot90/(dy=4,dx=0)，得到 pose=%d dy=%d dx=%d",
+			got.poseIndex, got.dy, got.dx)
+	}
+
+	// 独立整数穷举逐个列出四组最优解，明确防止回归。
+	type opt struct {
+		pose, dy, dx int
+	}
+	wantOpts := []opt{{1, 4, 0}, {2, -4, -5}, {5, -3, 0}, {7, 3, 0}}
+	gotOpts := []opt{}
+	for p := 0; p < 8; p++ {
+		for dy := -(n - 1); dy <= n-1; dy++ {
+			for dx := -(n - 1); dx <= n-1; dx++ {
+				if countOverlapDirect(ref, rec, n, p, dy, dx) == 4 {
+					gotOpts = append(gotOpts, opt{p, dy, dx})
+				}
+			}
+		}
+	}
+	if !reflect.DeepEqual(gotOpts, wantOpts) {
+		t.Fatalf("四组最优解枚举不一致：得到 %+v，期望 %+v", gotOpts, wantOpts)
+	}
+
+	// 红蓝叠加证据：规范解下 matched 恰为指定四点，缺陷总数不变；
+	// 2 个复检缺陷变换后移出画布。
+	resp, err := runAudit(ref, rec, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMatched := map[point]bool{
+		{7, 3}: true, {9, 4}: true, {10, 13}: true, {12, 13}: true,
+	}
+	if len(resp.Overlay.Matched) != 4 {
+		t.Fatalf("matched 应为 4 点，得到 %d", len(resp.Overlay.Matched))
+	}
+	for _, q := range resp.Overlay.Matched {
+		if !wantMatched[q] {
+			t.Fatalf("matched 出现非期望重合点 %v", q)
+		}
+	}
+	if resp.ReferenceCount != 14 || resp.RecheckCount != 14 {
+		t.Fatalf("缺陷总数不得改变：ref=%d rec=%d", resp.ReferenceCount, resp.RecheckCount)
+	}
+	if len(resp.Overlay.ReferenceOnly) != 10 || len(resp.Overlay.RecheckOnly) != 10 {
+		t.Fatalf("referenceOnly/recheckOnly 应为 10/10，得到 %d/%d",
+			len(resp.Overlay.ReferenceOnly), len(resp.Overlay.RecheckOnly))
+	}
+	if resp.Overlay.RecheckOut != 2 {
+		t.Fatalf("移出画布缺陷应为 2，得到 %d", resp.Overlay.RecheckOut)
+	}
+}
+
+func TestAllZeros(t *testing.T) {
+	n := 16
+	empty := make([][]uint8, n)
+	for r := range empty {
+		empty[r] = make([]uint8, n)
+	}
+	nonEmpty := randomMatrix(rand.New(rand.NewSource(9)), n, 0.1)
+
+	span := 2*n - 1
+	allTies := 8 * span * span
+	for _, tc := range []struct {
+		name     string
+		ref, rec [][]uint8
+	}{
+		{"两图全 0", empty, empty},
+		{"参考图全 0", empty, nonEmpty},
+		{"复检图全 0", nonEmpty, empty},
+	} {
+		got := searchMaxOverlap(tc.ref, tc.rec, n)
+		if got.maxOverlap != 0 || got.tieCount != allTies {
+			t.Fatalf("%s：应 max=0 ties=%d，得到 %+v", tc.name, allTies, got)
+		}
+		if got.poseIndex != 0 || got.dy != -(n-1) || got.dx != -(n-1) {
+			t.Fatalf("%s：规范解应为 identity/(%d,%d)，得到 %+v",
+				tc.name, -(n - 1), -(n - 1), got)
+		}
+		if got != bruteForce(tc.ref, tc.rec, n) {
+			t.Fatalf("%s：与暴力穷举不一致：%+v", tc.name, got)
+		}
+	}
+
+	// 经完整审计链路：全 0 对全 0 的叠加证据应为空、无画布外缺陷。
+	resp, err := runAudit(empty, empty, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.MaxOverlap != 0 || resp.TieCount != allTies ||
+		len(resp.Overlay.Matched) != 0 || len(resp.Overlay.ReferenceOnly) != 0 ||
+		len(resp.Overlay.RecheckOnly) != 0 || resp.Overlay.RecheckOut != 0 ||
+		resp.ReferenceCount != 0 || resp.RecheckCount != 0 {
+		t.Fatalf("全 0 审计响应异常：%+v", resp)
+	}
+}
+
+func TestUniqueOptimum(t *testing.T) {
+	// 无对称结构的稀疏点阵：复检图按 rot270 平移 (+3,+5) 拍摄，
+	// 审计要恢复参考图需施加其逆姿态 rot90 与反向旋转后的平移 (-5,+3)，
+	// 该最优必须唯一且被精确识别（不能被任何剪枝漏掉）。
+	rng := rand.New(rand.NewSource(11))
+	n := 32
+	ref := make([][]uint8, n)
+	for r := range ref {
+		ref[r] = make([]uint8, n)
+	}
+	pts := 0
+	for pts < 25 {
+		r := 6 + rng.Intn(20)
+		c := 6 + rng.Intn(20)
+		if ref[r][c] == 0 {
+			ref[r][c] = 1
+			pts++
+		}
+	}
+	const misPose, misDy, misDx = 3, 3, 5 // 装片方向（rot270）
+	rec := make([][]uint8, n)
+	for r := range rec {
+		rec[r] = make([]uint8, n)
+	}
+	for r := 0; r < n; r++ {
+		for c := 0; c < n; c++ {
+			if ref[r][c] == 0 {
+				continue
+			}
+			pr, pc := applyPose(misPose, r, c, n)
+			tr, tc := pr+misDy, pc+misDx
+			if tr < 0 || tr >= n || tc < 0 || tc >= n {
+				t.Fatalf("构造点 (%d,%d) 移出画布", tr, tc)
+			}
+			rec[tr][tc] = 1
+		}
+	}
+	got := searchMaxOverlap(ref, rec, n)
+	want := bruteForce(ref, rec, n)
+	if got != want {
+		t.Fatalf("唯一最优用例与暴力穷举不一致：%+v，参照 %+v", got, want)
+	}
+	if got.maxOverlap != 25 || got.tieCount != 1 {
+		t.Fatalf("应唯一重合 25 点，得到 max=%d ties=%d", got.maxOverlap, got.tieCount)
+	}
+	// 恢复变换：rot270 的逆姿态是 rot90；f1(f3(x)+(3,5)) = x+(5,-3)，故配准平移 (-5,+3)。
+	if got.poseIndex != 1 || got.dy != -5 || got.dx != 3 {
+		t.Fatalf("规范解应为 rot90/(dy=-5,dx=3)，得到 %+v", got)
+	}
 }
 
 func TestSearchMatchesBruteForce(t *testing.T) {

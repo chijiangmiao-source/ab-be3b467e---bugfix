@@ -119,54 +119,76 @@ type searchResult struct {
 	dy, dx     int // 规范解纵移、横移
 }
 
-func projectionCounts(m [][]uint8, n, poseIndex int) ([]int, []int) {
-	rows := make([]int, n)
-	cols := make([]int, n)
+// poseMatrix 返回 m 经第 p 种 D4 姿态变换后的 N×N 点阵（尚未平移）。
+func poseMatrix(m [][]uint8, n, p int) [][]uint8 {
+	out := make([][]uint8, n)
+	for r := range out {
+		out[r] = make([]uint8, n)
+	}
 	for r := 0; r < n; r++ {
 		for c := 0; c < n; c++ {
 			if m[r][c] == 0 {
 				continue
 			}
-			pr, pc := applyPose(poseIndex, r, c, n)
-			rows[pr]++
-			cols[pc]++
+			pr, pc := applyPose(p, r, c, n)
+			out[pr][pc] = 1
 		}
 	}
-	return rows, cols
+	return out
 }
 
-func bestProjectionOffsets(reference, recheck []int, n int) []int {
-	best := -1
-	offsets := make([]int, 0, 2*n-1)
-	for shift := -(n - 1); shift <= n-1; shift++ {
-		score := 0
-		for i, count := range recheck {
-			j := i + shift
-			if j >= 0 && j < n {
-				score += count * reference[j]
-			}
-		}
-		if score > best {
-			best = score
-			offsets = offsets[:0]
-			offsets = append(offsets, shift)
-		} else if score == best {
-			offsets = append(offsets, shift)
-		}
-	}
-	return offsets
-}
-
-// searchMaxOverlap 用自实现的二维 FFT 做精确整数互相关：
-// 对每种姿态，一次二维相关即得到横纵各 -(N-1)..(N-1) 全部 (2N-1)^2 个整数平移的重合数，
-// 因此稠密满尺寸输入的复杂度为 O(N^2 log N)，不会退化为逐点尝试全部平移。
+// correlationPose 计算一种姿态下复检图相对参考图的线性二维互相关：
+// 对横纵各 -(N-1)..(N-1) 的全部 (2N-1)^2 个整数平移 (dy,dx)，返回
+// 复检点经姿态变换并平移后落在参考图缺陷上的数量（移出画布者自然不计入）。
 //
-// 精确性：矩阵元素为 0/1，相关值上界为 N^2 <= 262144，float64 尾数 53 位，
-// L<=1024 的 FFT 舍入误差上界约 1e-10 量级，远低于 0.5，四舍五入后即为精确整数；
+// 在 L×L（L 为 >= 2N-1 的最小 2 的幂）补零网格上做频域循环相关：
+//
+//	corr = IFFT2(FFT2(ref) · conj(FFT2(recPose)))
+//
+// 两个点集都位于 N×N 内而 L >= 2N-1，跨周期卷绕不可能把点对到一起，
+// 循环相关即线性相关；负偏移 a 对应频率下标 a+L。一次二维 FFT 即得到
+// 全部整数平移的重合数，满尺寸稠密输入复杂度为 O(N² log N)，
+// 不会退化为逐平移尝试。
+//
+// 精确性：矩阵元素为 0/1，相关值上界为 N² <= 262144，float64 尾数 53 位，
+// L<=1024 的自实现 FFT 舍入误差远低于 0.5，四舍五入后即为精确整数；
 // 规范解还会被 countOverlapDirect 用纯整数逐一复核。
+//
+// 注意：不能用「行投影最优 dy × 列投影最优 dx」的一维剪枝替代二维相关——
+// 二维最优 (dy,dx) 的行投影分数与列投影分数都不必各自取到一维最大值，
+// 稀疏点阵下会漏掉绝大多数并列最优（实测 4 组并列最优只留下 1 组）。
+func correlationPose(refFreq, recPose []complex128, n, l int, roots *fftRoots) []int {
+	roots.fft2(recPose, l, false)
+	for i := range refFreq {
+		recPose[i] = refFreq[i] * complex(real(recPose[i]), -imag(recPose[i]))
+	}
+	roots.fft2(recPose, l, true)
+
+	span := 2*n - 1
+	out := make([]int, span*span)
+	for dy := -(n - 1); dy <= n-1; dy++ {
+		fy := dy
+		if fy < 0 {
+			fy += l
+		}
+		for dx := -(n - 1); dx <= n-1; dx++ {
+			fx := dx
+			if fx < 0 {
+				fx += l
+			}
+			out[(dy+n-1)*span+(dx+n-1)] = int(math.Round(real(recPose[fy*l+fx])))
+		}
+	}
+	return out
+}
+
+// searchMaxOverlap 穷举 8 种姿态 × 横纵各 -(N-1)..(N-1) 全部整数平移，
+// 用自实现的二维 FFT 精确整数互相关求最大重合数与并列最优数量，
+// 并按姿态顺序 → dy 升序 → dx 升序给出规范解。
 func searchMaxOverlap(ref, rec [][]uint8, n int) searchResult {
+	span := 2*n - 1
 	if countOnes(ref) == 0 || countOnes(rec) == 0 {
-		span := 2*n - 1
+		// 任一点集为空时所有平移的重合数都是 0，全部互为并列最优。
 		return searchResult{
 			maxOverlap: 0,
 			tieCount:   8 * span * span,
@@ -176,24 +198,46 @@ func searchMaxOverlap(ref, rec [][]uint8, n int) searchResult {
 		}
 	}
 
-	refRows, refCols := projectionCounts(ref, n, 0)
+	l := 1
+	for l < span {
+		l <<= 1
+	}
+	roots := newFFTRoots(l)
+
+	// 参考图的二维 FFT 对八种姿态共用，只计算一次。
+	refFreq := make([]complex128, l*l)
+	for r := 0; r < n; r++ {
+		for c := 0; c < n; c++ {
+			if ref[r][c] != 0 {
+				refFreq[r*l+c] = 1
+			}
+		}
+	}
+	roots.fft2(refFreq, l, false)
+
 	res := searchResult{maxOverlap: -1}
 	for p := 0; p < 8; p++ {
-		recRows, recCols := projectionCounts(rec, n, p)
-		dys := bestProjectionOffsets(refRows, recRows, n)
-		dxs := bestProjectionOffsets(refCols, recCols, n)
-		for _, dy := range dys {
-			for _, dx := range dxs {
-				v := countOverlapDirect(ref, rec, n, p, dy, dx)
-				// 严格大于才替换：姿态顺序、dy、dx 均升序遍历，首个最大值即规范解。
-				if v > res.maxOverlap {
-					res.maxOverlap = v
-					res.tieCount = 1
-					res.poseIndex = p
-					res.dy, res.dx = dy, dx
-				} else if v == res.maxOverlap {
-					res.tieCount++
+		recPose := poseMatrix(rec, n, p)
+		buf := make([]complex128, l*l)
+		for r := 0; r < n; r++ {
+			for c := 0; c < n; c++ {
+				if recPose[r][c] != 0 {
+					buf[r*l+c] = 1
 				}
+			}
+		}
+		corr := correlationPose(refFreq, buf, n, l, roots)
+		// corr 按 dy 升序、dx 升序排列；姿态本身也升序遍历，
+		// 严格大于才替换：首个达到最大值的 (姿态,dy,dx) 即规范解。
+		for i, v := range corr {
+			if v > res.maxOverlap {
+				res.maxOverlap = v
+				res.tieCount = 1
+				res.poseIndex = p
+				res.dy = -(n - 1) + i/span
+				res.dx = -(n - 1) + i%span
+			} else if v == res.maxOverlap {
+				res.tieCount++
 			}
 		}
 	}
